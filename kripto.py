@@ -5,7 +5,10 @@ import numpy as np, pandas as pd, requests
 # ================= PENGATURAN (boleh diubah) =================
 MODAL = 5_000_000    # angka awal di kotak modal, rupiah (bisa diganti di halaman)
 RISIKO = 1           # angka awal maksimal rugi per transaksi, % dari modal
-MIN_LIKUID = 1       # minimal volume 24 jam di Indodax, miliar rupiah
+MIN_TAMPIL = 50      # volume 24 jam di bawah ini (juta rupiah): koin dibuang dari halaman
+MIN_LIKUID = 200     # di bawah ini (juta rupiah): tampil tapi dicap kurang likuid
+RAMAI = 1000         # di atas ini (juta rupiah): dicap ramai
+YAKIN_PENUH = 1.0    # nilai belajar terbaik segini = suara strategi dipercaya penuh
 JUMLAH_TOP = 5
 HARI_DATA = 400      # berapa hari lilin 4 jam yang ditarik
 MIN_LILIN = 500      # koin dengan lilin kurang dari ini dilewati
@@ -64,7 +67,10 @@ def ambil_lilin(kode):
                 df = df.resample("4h").agg({"Open": "first", "High": "max", "Low": "min",
                                             "Close": "last", "Volume": "sum"}).dropna()
             df = df[(df["Close"] > 0) & (df["Low"] > 0)].iloc[:-1]      # buang lilin yang masih berjalan
-            if len(df) >= MIN_LILIN:
+            if len(df) < MIN_LILIN:
+                continue
+            mati = float((df["High"] == df["Low"]).iloc[-100:].mean())   # lilin rata = gak ada transaksi
+            if mati < 0.5:
                 return df
         except Exception:
             pass
@@ -85,7 +91,9 @@ def baca_daftar():
         for baris in fh:
             baris = baris.split("#")[0]
             for k in baris.replace(";", ",").replace(" ", ",").split(","):
-                k = k.strip().upper().replace("IDR", "") if k.strip().upper().endswith("IDR") else k.strip().upper()
+                k = k.strip().upper()
+                if k.endswith("IDR") and len(k) > 3:
+                    k = k[:-3]
                 if k and k not in kode:
                     kode.append(k)
     return kode
@@ -109,6 +117,13 @@ def harga_teks(h):
 
 def rp(h):
     return "Rp " + harga_teks(h)
+
+def vol_teks(v):
+    if v is None:
+        return "tidak diketahui"
+    if v >= 1e9:
+        return "Rp " + f"{v / 1e9:.1f}".replace(".", ",") + " miliar"
+    return f"Rp {v / 1e6:.0f} juta"
 
 def e(x):
     return html.escape(str(x))
@@ -167,6 +182,7 @@ def total(r):
     return float((1 + r).prod() - 1)
 
 def belajar(df):
+    """Bobot dari data belajar. Kalau gak ada strategi yang meyakinkan, suaranya dikecilin."""
     c = df["Close"]
     batas = int(len(df) * 0.7)
     tabel, daftar_pos = [], []
@@ -176,16 +192,17 @@ def belajar(df):
                       "ret_uji": total(r.iloc[batas:]), "posisi": int(pos.iloc[-1])})
         daftar_pos.append(pos)
     w = np.array([max(t["sharpe_latih"], 0.0) for t in tabel])
-    if w.sum() <= 0:
-        w = np.ones(len(tabel))
-    w = w / w.sum()
+    terbaik = float(w.max())
+    yakin = float(min(1.0, terbaik / YAKIN_PENUH))          # 0 kalau gak ada strategi yang untung
+    w = w / w.sum() if w.sum() > 0 else np.zeros(len(tabel))
     suara = pd.Series(0.0, index=c.index)
     for t, bobot, pos in zip(tabel, w, daftar_pos):
         t["bobot"] = float(bobot)
         suara = suara + bobot * (2 * pos - 1)
     pos_gab = (suara > 0).astype(float)
     r = hasil_per_lilin(c, pos_gab)
-    m = {"pos": pos_gab, "suara": float(suara.iloc[-1]),
+    mentah = float(suara.iloc[-1])
+    m = {"pos": pos_gab, "suara_mentah": mentah, "yakin": yakin, "terbaik": terbaik, "suara": mentah * yakin,
          "tabel": sorted(tabel, key=lambda t: t["bobot"], reverse=True),
          "jumlah_beli": sum(t["posisi"] for t in tabel), "jumlah": len(tabel),
          "ret_uji": total(r.iloc[batas:]), "sharpe_uji": sharpe(r.iloc[batas:]),
@@ -274,10 +291,11 @@ def proses(kode, df, btc_sehat, volume):
         skor -= 15
     skor = float(np.clip(skor, 0, 100))
     vol = volume.get(kode)
-    likuid = vol is None or vol >= MIN_LIKUID * 1e9
+    likuid = vol is None or vol >= MIN_LIKUID * 1e6
+    sinyal = "Beli" if m["suara"] > 0.05 else "Jual" if m["suara"] < -0.05 else "Netral"
     d = {"kode": kode, "df": df, "m": m, "skor": skor, "harga": harga, "akumulasi": akumulasi,
-         "vol": vol, "likuid": likuid, "rekom": label(skor) if likuid else LABEL[4],
-         "posisi": int(m["suara"] > 0)}
+         "vol": vol, "likuid": likuid, "ramai": vol is not None and vol >= RAMAI * 1e6,
+         "rekom": label(skor) if likuid else LABEL[4], "sinyal": sinyal}
     d.update(bikin_rencana(df, harga, float(atr(df).iloc[-1])))
     return d
 
@@ -402,20 +420,21 @@ function saring(){
   var cari=ambilNilai('f-cari').toUpperCase().split(/[ ,]+/).filter(function(k){return k;});
   var rekom=ambilNilai('f-rekom'), sinyal=ambilNilai('f-sinyal'), area=ambilNilai('f-area');
   var lulus=document.getElementById('f-lulus').checked, rrOk=document.getElementById('f-rr').checked;
+  var ramai=document.getElementById('f-ramai').checked;
   var tampil={}, n=0, semua=0;
   document.querySelectorAll('tr.baris').forEach(function(tr){
     semua++;
     var d=tr.dataset;
     var ok=(cari.length===0||cari.some(function(k){return d.kode.indexOf(k)>=0;}))
       &&(!rekom||d.rekom===rekom)&&(!sinyal||d.sinyal===sinyal)&&(!area||d.area===area)
-      &&(!rrOk||parseFloat(d.rr)>=RR_MIN_NILAI)&&(!lulus||d.lulus==='1');
+      &&(!rrOk||parseFloat(d.rr)>=RR_MIN_NILAI)&&(!lulus||d.lulus==='1')&&(!ramai||d.ramai==='1');
     tr.style.display=ok?'':'none'; tampil[d.kode]=ok; if(ok){n++;}
   });
   document.querySelectorAll('details.blok').forEach(function(el){el.style.display=tampil[el.id]===false?'none':'';});
   document.getElementById('f-jumlah').textContent='Menampilkan '+n+' dari '+semua+' koin';
 }
 document.getElementById('f-cari').addEventListener('input',saring);
-['f-rekom','f-sinyal','f-area','f-lulus','f-rr'].forEach(function(id){document.getElementById(id).addEventListener('change',saring);});
+['f-rekom','f-sinyal','f-area','f-lulus','f-rr','f-ramai'].forEach(function(id){document.getElementById(id).addEventListener('change',saring);});
 
 var kotakModal=document.getElementById('modal'), kotakRisiko=document.getElementById('risiko');
 function ribuan(x){return Math.round(x).toLocaleString('id-ID');}
@@ -470,10 +489,14 @@ def kekuatan(z):
     lemah = " (area lemah)" if z["sentuh"] < AREA_MIN_SENTUH else ""
     return f"disentuh {z['sentuh']} kali, terakhir {z['lalu']} lilin lalu{lemah}"
 
+def teks_ramai(d):
+    if not d["likuid"]:
+        return "⚠️ KURANG LIKUID di Indodax, selisih harga beli dan jual bisa lebar"
+    return "ramai" if d["ramai"] else "agak sepi, cek selisih harga beli dan jual sebelum transaksi"
+
 def blok_detail(d, btc_sehat):
     m = d["m"]
     masuk, stop, target = d["masuk"], d["stop"], d["target"]
-    arah = "BELI" if d["posisi"] == 1 else "JUAL / DI LUAR"
     if d["demand"]:
         baris_beli = f"Area beli (demand): <b>{rp(d['beli_bawah'])} sampai {rp(d['beli_atas'])}</b>, " + kekuatan(d["demand"])
     else:
@@ -483,8 +506,10 @@ def blok_detail(d, btc_sehat):
             "atr": "rumus ATR, karena gak ada area supply di atas harga"}[d["asal_target"]]
     layak = "layak" if d["rr"] >= RR_MIN else f"kurang layak, di bawah {RR_MIN:g}"
     teks_btc = {True: "sehat", False: "lemah (skor dipotong 15)", None: "data tidak tersedia"}[btc_sehat]
-    teks_vol = "tidak diketahui" if d["vol"] is None else f"Rp {d['vol'] / 1e9:,.1f} miliar".replace(",", "X").replace(".", ",").replace("X", ".")
-    teks_likuid = "cukup likuid" if d["likuid"] else "⚠️ KURANG LIKUID di Indodax"
+    if m["yakin"] <= 0:
+        teks_yakin = "<b>0%</b>, gak ada satu pun strategi yang untung di data belajar, jadi suaranya dianggap netral"
+    else:
+        teks_yakin = f"<b>{m['yakin'] * 100:.0f}%</b> (nilai belajar terbaik {m['terbaik']:+.2f}, dipercaya penuh kalau {YAKIN_PENUH:g} ke atas)"
     baris = "".join(f"<tr><td>{e(t['nama'])}</td><td>{t['sharpe_latih']:+.2f}</td><td>{t['bobot'] * 100:.0f}%</td>"
                     f"<td>{t['ret_uji'] * 100:+.1f}%</td><td>{'Beli' if t['posisi'] == 1 else 'Di luar'}</td></tr>"
                     for t in m["tabel"])
@@ -503,10 +528,11 @@ def blok_detail(d, btc_sehat):
 </ul>
 <p><b>Teknikal: {d['skor']:.0f}/100</b></p>
 <ul>
-<li>Suara gabungan {m['jumlah']} strategi: <b>{m['suara']:+.2f}</b> (skala -1 sampai +1), {m['jumlah_beli']} dari {m['jumlah']} lagi posisi beli → <b>{arah}</b></li>
+<li>Suara gabungan strategi: {m['suara_mentah']:+.2f} sebelum disesuaikan, <b>{m['suara']:+.2f}</b> setelah dikali kepercayaan → <b>{d['sinyal'].upper()}</b> ({m['jumlah_beli']} dari {m['jumlah']} strategi lagi posisi beli)</li>
+<li>Kepercayaan ke strategi: {teks_yakin}</li>
 <li>Ujian gabungan sejak {m['mulai_uji']:%d %b %Y}: {m['ret_uji'] * 100:+.1f}% vs beli-diamkan {m['bh_uji'] * 100:+.1f}% → <b>{TEKS_UJI[m['tingkat']]}</b></li>
 <li>Kondisi Bitcoin: {teks_btc}</li>
-<li>Arah volume: {'akumulasi' if d['akumulasi'] else 'distribusi'} · Volume 24 jam di Indodax: {teks_vol} → {teks_likuid}</li>
+<li>Arah volume: {'akumulasi' if d['akumulasi'] else 'distribusi'} · Volume 24 jam di Indodax: {vol_teks(d['vol'])} → {teks_ramai(d)}</li>
 </ul>
 <div class="geser"><table><tr><th>Strategi</th><th>Nilai belajar</th><th>Bobot suara</th><th>Hasil ujian</th><th>Posisi sekarang</th></tr>{baris}</table></div>
 </details>"""
@@ -517,7 +543,7 @@ def kepala(judul):
             f"<title>{judul}</title><style>{CSS}</style>"
             "<script src='https://cdn.plot.ly/plotly-2.35.2.min.js' charset='utf-8'></script></head><body>")
 
-def bikin_halaman(hasil, btc_sehat, dilewati, waktu_lilin):
+def bikin_halaman(hasil, btc_sehat, dilewati, sepi, waktu_lilin):
     wib = datetime.now(timezone(timedelta(hours=7)))
     b = [kepala("Ringkasan Kripto")]
     b.append("<h1>🪙 Ringkasan Kripto (Indodax, lilin 4 jam)</h1>")
@@ -531,7 +557,9 @@ def bikin_halaman(hasil, btc_sehat, dilewati, waktu_lilin):
     b.append("<p class='peringatan'>Kripto jauh lebih liar dari saham. Harga bisa lompat melewati stop loss, "
              "jadi rugi nyata bisa lebih besar dari hitungan di halaman ini.</p>")
     if dilewati:
-        b.append(f"<p class='info'>Dilewati (gak ada di Indodax atau datanya kurang): {e(', '.join(dilewati))}</p>")
+        b.append(f"<p class='info'>Dilewati (gak ada di Indodax, datanya kurang, atau gak ada transaksi): {e(', '.join(dilewati))}</p>")
+    if sepi:
+        b.append(f"<p class='info'>Dibuang karena volume 24 jamnya di bawah Rp {MIN_TAMPIL} juta: {e(', '.join(sepi))}</p>")
     b.append("<div class='modal-box'>"
              f"<label>Modal (Rp) <input id='modal' type='text' inputmode='numeric' value='{MODAL}'></label>"
              f"<label>Maks rugi per transaksi (%) <input id='risiko' type='text' inputmode='decimal' value='{RISIKO}'></label>"
@@ -550,7 +578,8 @@ def bikin_halaman(hasil, btc_sehat, dilewati, waktu_lilin):
                      f"Harga {rp(d['harga'])}<br>{beli}{TEKS_AREA[d['posisi_area']]}<br>"
                      f"Stop loss {rp(d['stop'])}<br>Target {rp(d['target'])}<br>"
                      f"{'⚠️ ' if lemah else ''}Untung banding rugi {d['rr']:.1f} : 1<br>"
-                     f"Suara strategi {d['m']['jumlah_beli']}/{d['m']['jumlah']} beli<br>"
+                     f"Kepercayaan strategi {d['m']['yakin'] * 100:.0f}%<br>"
+                     f"Volume {vol_teks(d['vol'])}<br>"
                      f"Maks beli <b><span {atribut(d)}></span></b></div>")
         b.append("</div>")
     else:
@@ -560,22 +589,26 @@ def bikin_halaman(hasil, btc_sehat, dilewati, waktu_lilin):
     pilihan = "".join(f"<option value='{e(x)}'>{e(x)}</option>" for x in LABEL)
     b.append("<div class='filter'><input id='f-cari' type='text' placeholder='Cari kode, misal BTC, SOL'>"
              f"<select id='f-rekom'><option value=''>Semua rekomendasi</option>{pilihan}</select>"
-             "<select id='f-sinyal'><option value=''>Semua sinyal</option><option value='Beli'>Beli</option><option value='Jual'>Jual</option></select>"
+             "<select id='f-sinyal'><option value=''>Semua sinyal</option><option value='Beli'>Beli</option>"
+             "<option value='Netral'>Netral</option><option value='Jual'>Jual</option></select>"
              "<select id='f-area'><option value=''>Semua posisi harga</option><option value='di'>Di area beli</option>"
              "<option value='dekat'>Dekat area beli</option><option value='jauh'>Jauh dari area beli</option></select>"
+             f"<label><input type='checkbox' id='f-ramai'> Cuma yang ramai (Rp {RAMAI / 1000:g} miliar ke atas)</label>"
              "<label><input type='checkbox' id='f-lulus'> Cuma yang lulus ujian</label>"
              f"<label><input type='checkbox' id='f-rr'> U:R minimal {RR_MIN:g}</label><div id='f-jumlah'></div></div>")
     b.append("<div class='geser'><table><tr><th>Kode</th><th>Harga (Rp)</th><th>Skor</th><th class='kiri'>Rekomendasi</th>"
-             "<th class='kiri'>Sinyal</th><th class='kiri'>Area beli</th><th>Stop loss</th><th>Target</th><th>U:R</th></tr>")
+             "<th class='kiri'>Sinyal</th><th>Yakin</th><th class='kiri'>Area beli</th><th>Stop loss</th><th>Target</th>"
+             "<th>U:R</th><th>Volume 24 jam</th></tr>")
     ikon = {"di": "✅ ", "dekat": "🟡 ", "jauh": "⏳ ", "": ""}
     for d in hasil:
-        sinyal = "Beli" if d["posisi"] == 1 else "Jual"
-        b.append(f"<tr class='baris' data-kode='{d['kode']}' data-rekom='{e(d['rekom'])}' data-sinyal='{sinyal}' "
-                 f"data-area='{d['posisi_area']}' data-rr='{d['rr']:.2f}' data-lulus='{'1' if d['m']['tingkat'] == 'lulus' else '0'}'>"
+        b.append(f"<tr class='baris' data-kode='{d['kode']}' data-rekom='{e(d['rekom'])}' data-sinyal='{d['sinyal']}' "
+                 f"data-area='{d['posisi_area']}' data-rr='{d['rr']:.2f}' data-ramai='{'1' if d['ramai'] else '0'}' "
+                 f"data-lulus='{'1' if d['m']['tingkat'] == 'lulus' else '0'}'>"
                  f"<td><a href='#{d['kode']}'><b>{d['kode']}</b></a></td><td>{harga_teks(d['harga'])}</td><td>{d['skor']:.0f}</td>"
-                 f"<td class='kiri'>{d['rekom']}</td><td class='kiri'>{sinyal} {d['m']['jumlah_beli']}/{d['m']['jumlah']}</td>"
-                 f"<td class='kiri'>{ikon[d['posisi_area']]}{area_teks(d)}</td>"
-                 f"<td>{harga_teks(d['stop'])}</td><td>{harga_teks(d['target'])}</td><td>{d['rr']:.1f}</td></tr>")
+                 f"<td class='kiri'>{d['rekom']}</td><td class='kiri'>{d['sinyal']} {d['m']['jumlah_beli']}/{d['m']['jumlah']}</td>"
+                 f"<td>{d['m']['yakin'] * 100:.0f}%</td><td class='kiri'>{ikon[d['posisi_area']]}{area_teks(d)}</td>"
+                 f"<td>{harga_teks(d['stop'])}</td><td>{harga_teks(d['target'])}</td><td>{d['rr']:.1f}</td>"
+                 f"<td>{vol_teks(d['vol'])}</td></tr>")
     b.append("</table></div>")
 
     b.append("<h2>Detail per koin</h2><p class='info'>Klik buat buka grafik lilin 4 jam dan penjelasannya. "
@@ -652,8 +685,12 @@ def bikin_rekam(rekam):
 def utama():
     daftar_kode = baca_daftar()
     volume = ambil_volume()
-    lilin, dilewati = {}, []
+    lilin, dilewati, sepi = {}, [], []
     for kode in daftar_kode:
+        vol = volume.get(kode)
+        if kode != "BTC" and vol is not None and vol < MIN_TAMPIL * 1e6:
+            sepi.append(kode)
+            continue
         print("Ambil", kode)
         df = ambil_lilin(kode)
         if df is None:
@@ -703,11 +740,11 @@ def utama():
             perbarui(r, lilin[r["kode"]], btc)
 
     with open("docs/index.html", "w", encoding="utf-8") as fh:
-        fh.write(bikin_halaman(hasil, btc_sehat, dilewati, waktu_lilin))
+        fh.write(bikin_halaman(hasil, btc_sehat, dilewati, sepi, waktu_lilin))
     with open("docs/rekam.html", "w", encoding="utf-8") as fh:
         fh.write(bikin_rekam(rekam))
     with open("docs/rekam.json", "w", encoding="utf-8") as fh:
         json.dump(rekam, fh, ensure_ascii=False)
-    print("Selesai:", len(hasil), "koin,", len(dilewati), "dilewati,", len(rekam), "catatan rekam jejak")
+    print("Selesai:", len(hasil), "koin,", len(dilewati), "dilewati,", len(sepi), "terlalu sepi,", len(rekam), "catatan")
 
 utama()
